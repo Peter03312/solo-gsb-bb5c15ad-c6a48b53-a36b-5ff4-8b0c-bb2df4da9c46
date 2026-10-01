@@ -69,7 +69,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -109,12 +109,77 @@ def add_audit(
     detail: str,
     document_id: int | None = None,
     request_id: int | None = None,
-) -> None:
-    conn.execute(
+    at: str | None = None,
+) -> int:
+    """追加一条审计记录并返回其自增序号（即事件的全局顺序号）。"""
+    cur = conn.execute(
         """INSERT INTO audit_log (at, actor_id, action, document_id, request_id, detail)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (utc_str(now_utc()), actor_id, action, document_id, request_id, detail),
+        (at or utc_str(now_utc()), actor_id, action, document_id, request_id, detail),
     )
+    return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# 站内通知
+#
+# 四类状态变更在发生的**同一写事务内**向相关参与方各固定投递一条通知：
+#   - opened（资料开封）：当时封存人 + 三名当前见证人；
+#   - purged（到期清除）：当时封存人 + 三名当前见证人；
+#   - witness_replaced（见证人替换）：封存人 + 新旧见证人各一条
+#     （即封存人、旧见证人、新见证人；其余两名见证人也在“三名当前见证人”
+#     内，因此仍是封存人 + 当前三名见证人，旧见证人额外保留一条）；
+#   - handover_confirmed（交接确认）：新旧封存人 + 三名当前见证人。
+# 收件人在事务内随当时名单固定；通知只含资料编号、事件类型、事件时刻与
+# 已读状态，**不含正文、凭证或密钥**。通知随事务提交，失败/回滚不留通知。
+# ---------------------------------------------------------------------------
+
+# 会向参与方投递站内通知的事件类型（与通知表 CHECK 约束保持一致）
+NOTIFY_EVENT_TYPES = ("opened", "purged", "witness_replaced", "handover_confirmed")
+
+
+def doc_owner_and_witness_ids(tx: sqlite3.Connection, doc_id: int) -> tuple[int, list[int]]:
+    """取资料“当前”封存人与当前三名见证人（按名单顺序）的账号编号。"""
+    owner_id = tx.execute(
+        "SELECT owner_id FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()["owner_id"]
+    witness_ids = [
+        row["user_id"]
+        for row in tx.execute(
+            "SELECT user_id FROM document_witnesses WHERE document_id = ? ORDER BY position",
+            (doc_id,),
+        ).fetchall()
+    ]
+    return owner_id, witness_ids
+
+
+def notify_event(
+    tx: sqlite3.Connection,
+    *,
+    doc_id: int,
+    event_type: str,
+    event_seq: int,
+    event_at: str,
+    recipient_ids,
+) -> None:
+    """在已持有的写事务内向各收件人投递同一事件的通知。
+
+    收件人编号去重后逐条插入；UNIQUE(event_seq, recipient_id) 兜底，保证
+    扫描器与请求并发结算同一变化时同一收件人绝不会收到两条。
+    """
+    assert event_type in NOTIFY_EVENT_TYPES
+    now = utc_str(now_utc())
+    seen: set[int] = set()
+    for uid in recipient_ids:
+        if uid is None or uid in seen:
+            continue
+        seen.add(uid)
+        tx.execute(
+            "INSERT INTO notifications"
+            " (recipient_id, document_id, event_seq, event_type, event_at, read_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, NULL, ?)",
+            (uid, doc_id, event_seq, event_type, event_at, now),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +212,24 @@ def open_request_now(
         "UPDATE open_requests SET status='opened', resolved_at=? WHERE id=?",
         (now, req_id),
     )
-    add_audit(
+    event_seq = add_audit(
         tx,
         actor_id=actor_id,
         action="opened",
         document_id=doc_id,
         request_id=req_id,
         detail=detail,
+        at=now,
+    )
+    # 通知：资料开封时刻的封存人 + 三名当前见证人，收件人在同一事务内固定。
+    owner_id, witness_ids = doc_owner_and_witness_ids(tx, doc_id)
+    notify_event(
+        tx,
+        doc_id=doc_id,
+        event_type="opened",
+        event_seq=event_seq,
+        event_at=now,
+        recipient_ids=[owner_id, *witness_ids],
     )
     invalidate_pending_invitations(
         tx,
@@ -315,7 +391,7 @@ def purge_document_now(
         " WHERE id=? AND status IN ('sealed', 'opened')",
         (purge_at, doc_id),
     )
-    add_audit(
+    event_seq = add_audit(
         tx,
         actor_id=actor_id,
         action="purged",
@@ -324,6 +400,18 @@ def purge_document_now(
             f"已到清除时刻 {purge_at}，资料正文已清除；"
             "摘要、参与方与审计元数据保留，任何接口不再返回正文"
         ),
+        at=now,
+    )
+    # 通知：清除时刻的封存人 + 三名当前见证人（清除不改变参与方），
+    # 收件人在同一事务内固定。
+    owner_id, witness_ids = doc_owner_and_witness_ids(tx, doc_id)
+    notify_event(
+        tx,
+        doc_id=doc_id,
+        event_type="purged",
+        event_seq=event_seq,
+        event_at=now,
+        recipient_ids=[owner_id, *witness_ids],
     )
 
 
@@ -500,7 +588,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -582,6 +670,92 @@ def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 本人站内通知
+#
+# 账号凭现有 X-API-Key 只读取**自己收到**的通知：通知不随资料权限变化而
+# 收回——失去某份资料参与方身份（被替换的旧见证人、交接后的旧封存人）后，
+# 仍可读自己收到的通知，但通知不含正文/凭证/密钥，也不借此开放任何资料
+# 访问。通知按事件序号（event_seq，即审计自增序号）升序排列，采用“非负
+# 事件序号游标”分页：cursor 表示“只返回 event_seq > cursor 的通知”，
+# 响应给出可直接带入下一页的 next_cursor（最后一页为 null）。
+# ---------------------------------------------------------------------------
+
+
+def _serialize_notification(row: sqlite3.Row) -> dict[str, Any]:
+    """通知视图：只含编号、资料编号、事件类型、事件时刻与已读状态。"""
+    return {
+        "notification_id": row["id"],
+        "document_id": row["document_id"],
+        "event_seq": row["event_seq"],
+        "event_type": row["event_type"],
+        "event_at": row["event_at"],
+        "read": row["read_at"] is not None,
+        "read_at": row["read_at"],
+    }
+
+
+@app.get("/notifications")
+def list_notifications(
+    cursor: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """读取本人通知（按事件序号升序）。
+
+    - `cursor`：非负事件序号游标，只返回 `event_seq > cursor` 的通知；
+      首页传 0 或不传；非法（负数）或非整数由 422 拒绝。
+    - `limit`：页大小 1～100（默认 20）；超出范围由 422 拒绝。
+    - `next_cursor`：可直接作为下一页游标；已无更多记录时为 `null`。
+    只读本人通知，无需也无法访问对应资料。
+    """
+    rows = db.execute(
+        "SELECT * FROM notifications WHERE recipient_id = ? AND event_seq > ?"
+        " ORDER BY event_seq ASC, id ASC LIMIT ?",
+        (user["id"], cursor, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    # 还有更多时以本页最后一个事件序号作为下一游标（下一页 event_seq > 它）；
+    # 已无更多时为 null。同一 event_seq 的多条通知会在同一页内全部返回，
+    # 游标按事件序号推进不会跳过它们。
+    next_cursor = page[-1]["event_seq"] if has_more else None
+    return {
+        "notifications": [_serialize_notification(row) for row in page],
+        "next_cursor": next_cursor,
+    }
+
+
+@app.post("/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """按通知编号把**本人**通知标记已读，返回已读状态。
+
+    幂等：已是已读则保留首次已读时刻、返回相同状态，重试不产生额外记录；
+    通知编号不属于本人（含根本不存在）统一 403，绝不修改任何状态。
+    """
+    now = utc_str(now_utc())
+    with write_tx(db) as tx:
+        row = tx.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+        if row is None or row["recipient_id"] != user["id"]:
+            # 他人通知编号与不存在编号不可区分，统一 403，且不改状态
+            raise err(403, "无权操作该通知或通知不存在")
+        tx.execute(
+            "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+            (now, notification_id),
+        )
+        row = tx.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+    return _serialize_notification(row)
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1408,13 @@ def replace_witness(
                 request_id=req_info["request_id"] if req_info else None,
                 detail="；".join(details),
             )
+            event_seq = tx.execute(
+                "SELECT id FROM audit_log WHERE document_id = ? ORDER BY id DESC LIMIT 1",
+                (doc_id,),
+            ).fetchone()["id"]
+            event_at = tx.execute(
+                "SELECT at FROM audit_log WHERE id = ?", (event_seq,)
+            ).fetchone()["at"]
 
             witnesses = [
                 row["username"]
@@ -1244,6 +1425,21 @@ def replace_witness(
                     (doc_id,),
                 ).fetchall()
             ]
+            # 通知：封存人 + 新名单三名见证人；旧见证人即使已不在名单也固定
+            # 收到一条（去重后自然只保留一条）。收件人在本事务内随名单固定。
+            _, current_witness_ids = doc_owner_and_witness_ids(tx, doc_id)
+            notify_event(
+                tx,
+                doc_id=doc_id,
+                event_type="witness_replaced",
+                event_seq=event_seq,
+                event_at=event_at,
+                recipient_ids=[
+                    user["id"],
+                    *current_witness_ids,
+                    old_row["user_id"],  # 旧见证人：被替换出名单仍要通知
+                ],
+            )
             result = {
                 "document_id": doc_id,
                 "status": "sealed",
@@ -1581,8 +1777,9 @@ def confirm_handover(
                 detail="封存人交接已完成，其他待确认邀请失效",
             )
 
+            old_owner_id = doc["owner_id"]
             old_owner = tx.execute(
-                "SELECT username FROM users WHERE id = ?", (doc["owner_id"],)
+                "SELECT username FROM users WHERE id = ?", (old_owner_id,)
             ).fetchone()["username"]
 
             # 结算顺序第 3 步：转移封存人身份；名单、正文、摘要不变。
@@ -1594,7 +1791,7 @@ def confirm_handover(
                 "UPDATE handover_invitations SET status='confirmed', resolved_at=? WHERE id=?",
                 (now, invitation_id),
             )
-            add_audit(
+            event_seq = add_audit(
                 tx,
                 actor_id=user["id"],
                 action="handover_confirmed",
@@ -1603,6 +1800,7 @@ def confirm_handover(
                     f"封存人交接完成：{old_owner} -> {user['username']}；"
                     "见证名单、正文与摘要不变；原封存人失去该资料权限"
                 ),
+                at=now,
             )
 
             witnesses = [
@@ -1614,6 +1812,17 @@ def confirm_handover(
                     (doc["id"],),
                 ).fetchall()
             ]
+            # 通知：新（受让人）旧封存人 + 三名当前见证人；交接不改变见证
+            # 名单，“当时”见证人即当前见证人。收件人在本事务内固定。
+            _, current_witness_ids = doc_owner_and_witness_ids(tx, doc["id"])
+            notify_event(
+                tx,
+                doc_id=doc["id"],
+                event_type="handover_confirmed",
+                event_seq=event_seq,
+                event_at=now,
+                recipient_ids=[old_owner_id, user["id"], *current_witness_ids],
+            )
             inv = tx.execute(
                 "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
             ).fetchone()

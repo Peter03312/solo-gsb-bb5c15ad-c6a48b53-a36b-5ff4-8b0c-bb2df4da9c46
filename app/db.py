@@ -107,6 +107,28 @@ CREATE TABLE IF NOT EXISTS view_passes (
 );
 CREATE INDEX IF NOT EXISTS idx_view_passes_document ON view_passes(document_id);
 
+-- 站内通知：状态变更（开封/到期清除/见证人替换/交接确认）在同一写事务内
+-- 向“状态变更时”的封存人与见证人各投递一条。收件人在同一事务内固定，
+-- 通知不含正文/凭证/密钥；event_seq 即触发事件的审计记录序号（audit_log.id），
+-- 全局自增，按其升序排列即事件发生顺序。
+-- UNIQUE(event_seq, recipient_id) 是“同一变化只投递一次”的最终兜底：
+-- 即使扫描器与请求并发结算同一变化，重复插入也只会失败并随事务回滚。
+CREATE TABLE IF NOT EXISTS notifications (
+    id           INTEGER PRIMARY KEY,
+    recipient_id INTEGER NOT NULL REFERENCES users(id),  -- 收件人（状态变更时固定）
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    event_seq    INTEGER NOT NULL REFERENCES audit_log(id),  -- 触发事件的审计序号
+    event_type   TEXT NOT NULL CHECK (event_type IN
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed')),
+    event_at     TEXT NOT NULL,            -- 事件时刻（与对应审计记录同时刻）
+    read_at      TEXT,                     -- 已读时刻；NULL 表示未读
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_seq
+    ON notifications(recipient_id, event_seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_recipient_event
+    ON notifications(recipient_id, event_seq);
+
 -- 审计快照签名密钥：单行表，首次使用时生成并持久化，
 -- 重启后旧快照签名仍可验证；secret_seed 仅服务端持有，任何接口不返回。
 CREATE TABLE IF NOT EXISTS signing_keys (
