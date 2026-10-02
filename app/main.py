@@ -57,6 +57,18 @@
 - 当前封存人凭凭证编号可在兑换前撤销（资料到清除时刻或被改期清除的同样拒绝）；
   签发、成功兑换、撤销均按顺序追加到原有 audit_log 审计链；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
+- 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
+  事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
+  时通知封存人和新旧见证人；交接确认（handover_confirmed）时通知新旧封存人
+  及三名见证人。收件人在状态变更的同一事务内按当时名单固定，事件序号
+  （event_seq）取该状态变更主审计记录的 audit_log.id，通知按事件序号排列，
+  内容只含资料编号、事件类型、事件时刻与已读状态，不含正文、凭证或密钥。
+  账号凭现有 X-API-Key 以非负事件序号游标和 1～100 页大小读取本人通知及下一
+  游标，并按通知编号标记已读（幂等，返回已读状态）；非法游标/页大小拒绝
+  （422），他人或不存在的通知编号统一 403 且不改状态。失去资料权限的人仍可
+  读自己收到的通知，但不能借此访问资料（通知不含正文/凭证/密钥）。失败或
+  回滚的操作不留通知；扫描器与请求并发结算同一变化不重复投递（通知与状态
+  变更同事务 + UNIQUE(recipient_id, event_seq) 兜底），已读重试不产生额外记录。
 """
 import asyncio
 import base64
@@ -69,7 +81,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -109,12 +121,63 @@ def add_audit(
     detail: str,
     document_id: int | None = None,
     request_id: int | None = None,
-) -> None:
-    conn.execute(
+) -> int:
+    """追加一条审计记录，返回其自增序号（即事件在审计链上的全局序号）。
+
+    通知的事件序号（event_seq）即取状态变更主审计记录的序号，保证通知与
+    审计链上的事件一一对应、按同一全局顺序排列。
+    """
+    cur = conn.execute(
         """INSERT INTO audit_log (at, actor_id, action, document_id, request_id, detail)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (utc_str(now_utc()), actor_id, action, document_id, request_id, detail),
     )
+    return int(cur.lastrowid)
+
+
+def participant_ids(tx: sqlite3.Connection, doc_id: int, owner_id: int) -> set[int]:
+    """取某资料“当时的封存人 + 三名指定见证人”的账号编号集合。
+
+    在已持有的写事务内按当前名单计算：开封/清除在其结算时刻取名单，
+    替换在名单更新后取（封存人 + 新旧见证人并集），交接确认在转移
+    owner 后取（新旧封存人 + 三名见证人并集）。
+    """
+    ids = {owner_id}
+    ids.update(
+        row["user_id"]
+        for row in tx.execute(
+            "SELECT user_id FROM document_witnesses WHERE document_id = ?",
+            (doc_id,),
+        ).fetchall()
+    )
+    return ids
+
+
+def fanout_notifications(
+    tx: sqlite3.Connection,
+    *,
+    recipients: set[int],
+    document_id: int,
+    event_seq: int,
+    event_type: str,
+    at: str,
+) -> None:
+    """在状态变更的同一写事务内，给每名收件人各写一条通知。
+
+    - 收件人在调用前已按状态变更时刻的封存人/见证人名单在事务内固定；
+    - event_seq 取该状态变更主审计记录的 audit_log.id，通知按事件序号排列；
+    - 内容只含资料编号、事件类型、事件时刻与已读状态，绝不含正文、凭证或密钥；
+    - 与状态变更同事务：变更回滚则通知一并回滚，不留通知；变更已提交则
+      通知必已写入，扫描器与请求并发结算同一变化时唯一约束兜底不重复投递。
+    """
+    now = utc_str(now_utc())
+    for recipient_id in sorted(recipients):
+        tx.execute(
+            "INSERT INTO notifications"
+            " (recipient_id, document_id, event_seq, event_type, at, is_read, created_at)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (recipient_id, document_id, event_seq, event_type, at, now),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +201,8 @@ def open_request_now(
     """在已持有的写事务内把资料与请求置为 opened 并追加审计。
 
     资料一旦开封，其上待确认的封存人交接邀请不再可确认，随开封一并失效。
+    开封成功的同一事务内，按“开封时刻的封存人 + 三名见证人”各记一条
+    opened 通知（事件序号取 opened 审计记录序号）。
     """
     tx.execute(
         "UPDATE documents SET status='opened', opened_at=? WHERE id=? AND status='sealed'",
@@ -147,7 +212,7 @@ def open_request_now(
         "UPDATE open_requests SET status='opened', resolved_at=? WHERE id=?",
         (now, req_id),
     )
-    add_audit(
+    event_seq = add_audit(
         tx,
         actor_id=actor_id,
         action="opened",
@@ -160,6 +225,17 @@ def open_request_now(
         doc_id=doc_id,
         now=now,
         detail="资料已开封，待确认的封存人交接邀请失效",
+    )
+    owner_id = tx.execute(
+        "SELECT owner_id FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()["owner_id"]
+    fanout_notifications(
+        tx,
+        recipients=participant_ids(tx, doc_id, owner_id),
+        document_id=doc_id,
+        event_seq=event_seq,
+        event_type="opened",
+        at=now,
     )
 
 
@@ -315,7 +391,7 @@ def purge_document_now(
         " WHERE id=? AND status IN ('sealed', 'opened')",
         (purge_at, doc_id),
     )
-    add_audit(
+    event_seq = add_audit(
         tx,
         actor_id=actor_id,
         action="purged",
@@ -324,6 +400,19 @@ def purge_document_now(
             f"已到清除时刻 {purge_at}，资料正文已清除；"
             "摘要、参与方与审计元数据保留，任何接口不再返回正文"
         ),
+    )
+    # 清除时刻的封存人 + 三名见证人各记一条 purged 通知；与清除同事务，
+    # 失败/回滚不留通知，扫描器与请求并发结算同一变化不重复投递。
+    owner_id = tx.execute(
+        "SELECT owner_id FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()["owner_id"]
+    fanout_notifications(
+        tx,
+        recipients=participant_ids(tx, doc_id, owner_id),
+        document_id=doc_id,
+        event_seq=event_seq,
+        event_type="purged",
+        at=purge_at,
     )
 
 
@@ -500,7 +589,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -1226,13 +1315,25 @@ def replace_witness(
                     "approval_count": count,
                 }
 
-            add_audit(
+            # 通知收件人在状态变更的同一事务内固定：封存人、旧见证人、
+            # 新见证人。新见证人此刻已在三名名单中，旧见证人已不在名单，
+            # 故取“旧名单 + 新见证人”（即封存人 + 新旧见证人并集）。
+            event_seq = add_audit(
                 tx,
                 actor_id=user["id"],
                 action="witness_replaced",
                 document_id=doc_id,
                 request_id=req_info["request_id"] if req_info else None,
                 detail="；".join(details),
+            )
+            recipients = participant_ids(tx, doc_id, user["id"]) | {old_row["user_id"]}
+            fanout_notifications(
+                tx,
+                recipients=recipients,
+                document_id=doc_id,
+                event_seq=event_seq,
+                event_type="witness_replaced",
+                at=now,
             )
 
             witnesses = [
@@ -1581,9 +1682,10 @@ def confirm_handover(
                 detail="封存人交接已完成，其他待确认邀请失效",
             )
 
-            old_owner = tx.execute(
-                "SELECT username FROM users WHERE id = ?", (doc["owner_id"],)
-            ).fetchone()["username"]
+            old_owner_row = tx.execute(
+                "SELECT id, username FROM users WHERE id = ?", (doc["owner_id"],)
+            ).fetchone()
+            old_owner = old_owner_row["username"]
 
             # 结算顺序第 3 步：转移封存人身份；名单、正文、摘要不变。
             tx.execute(
@@ -1594,7 +1696,7 @@ def confirm_handover(
                 "UPDATE handover_invitations SET status='confirmed', resolved_at=? WHERE id=?",
                 (now, invitation_id),
             )
-            add_audit(
+            event_seq = add_audit(
                 tx,
                 actor_id=user["id"],
                 action="handover_confirmed",
@@ -1603,6 +1705,18 @@ def confirm_handover(
                     f"封存人交接完成：{old_owner} -> {user['username']}；"
                     "见证名单、正文与摘要不变；原封存人失去该资料权限"
                 ),
+            )
+            # 收件人在身份转移的同一事务内固定：新封存人（受让人）、旧封存人
+            # 与当前三名见证人。转移后 participant_ids 取到新封存人 + 见证人，
+            # 并集补上旧封存人编号。
+            recipients = participant_ids(tx, doc["id"], user["id"]) | {old_owner_row["id"]}
+            fanout_notifications(
+                tx,
+                recipients=recipients,
+                document_id=doc["id"],
+                event_seq=event_seq,
+                event_type="handover_confirmed",
+                at=now,
             )
 
             witnesses = [
@@ -2041,6 +2155,105 @@ def get_audit(
         (doc_id,),
     ).fetchall()
     return {"document_id": doc_id, "records": [dict(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 站内通知（收件人只读自己的通知；不再反查资料权限）
+#
+# 四类资料状态变更在状态变更的同一写事务内向固定收件人各投递一条通知：
+#   - opened（资料开封）：当时封存人 + 三名见证人；
+#   - purged（到期清除）：当时封存人 + 三名见证人；
+#   - witness_replaced（见证人替换）：封存人 + 旧见证人 + 新见证人；
+#   - handover_confirmed（交接确认）：新旧封存人 + 三名见证人。
+# event_seq 固定为该状态变更主审计记录的 audit_log.id（全局事件序号），
+# 通知按事件序号排列；同一事件对每名收件人恰好一条
+# （UNIQUE(recipient_id, event_seq)）。通知只含资料编号、事件类型、事件
+# 时刻与已读状态——绝不含正文、凭证或密钥。失败或回滚的操作不留通知。
+#
+# 账号凭现有 X-API-Key 读取：非负事件序号游标 + 1～100 页大小，只返回本人
+# 通知与下一游标；按通知编号标记已读并返回已读状态。非法游标/页大小（422）、
+# 他人或不存在的通知编号（403）一律拒绝且不改状态；已读重试幂等，不产生
+# 额外记录。失去资料权限的人（被替换的旧见证人、交接后的旧封存人等）仍可
+# 读自己收到的通知，但通知不提供任何资料正文/凭证/密钥，不能借此访问资料。
+# ---------------------------------------------------------------------------
+
+
+def _serialize_notification(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "notification_id": row["id"],
+        "event_seq": row["event_seq"],
+        "document_id": row["document_id"],
+        "event_type": row["event_type"],
+        "at": row["at"],
+        "is_read": bool(row["is_read"]),
+    }
+
+
+@app.get("/notifications")
+def list_notifications(
+    cursor: int = Query(default=0, ge=0, description="事件序号游标：只返回 event_seq 大于该值的通知"),
+    page_size: int = Query(
+        default=20, ge=1, le=100, alias="page_size", description="页大小（1～100）"
+    ),
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """读取本人通知：按事件序号升序，非负游标分页，返回通知与下一游标。
+
+    游标语义为“上一页最后一条通知的 event_seq”：只返回 event_seq > cursor
+    的记录；页内严格按 (event_seq, id) 升序。下一游标为本页最后一条通知的
+    事件序号；本页之后再无更新的通知时为 null。通知不含正文、凭证或密钥。
+    """
+    rows = db.execute(
+        "SELECT * FROM notifications WHERE recipient_id = ? AND event_seq > ?"
+        " ORDER BY event_seq, id LIMIT ?",
+        (user["id"], cursor, page_size + 1),
+    ).fetchall()
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    next_cursor = page[-1]["event_seq"] if (has_more and page) else None
+    return {
+        "notifications": [_serialize_notification(r) for r in page],
+        "next_cursor": next_cursor,
+    }
+
+
+@app.post("/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """把本人的一条通知标记已读并返回已读状态。
+
+    条件更新只翻转本人名下通知（id 与收件人同时匹配）；他人通知编号或不存在
+    的编号统一 403，不区分是否存在，且不改任何状态。重复标记幂等：保留首次
+    read_at，不产生额外记录，也不写审计。
+    """
+    now = utc_str(now_utc())
+    with write_tx(db) as tx:
+        row = tx.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+        if row is None or row["recipient_id"] != user["id"]:
+            # 他人通知/不存在统一拒绝，不泄露通知存在性；只读判断在写锁内完成，
+            # 条件更新本身也按 recipient_id 限定，双保险。
+            raise err(403, "无权操作该通知或通知不存在")
+        cur = tx.execute(
+            "UPDATE notifications SET is_read = 1,"
+            " read_at = COALESCE(read_at, ?) WHERE id = ? AND recipient_id = ?",
+            (now, notification_id, user["id"]),
+        )
+        if cur.rowcount != 1:  # 理论不可达：上面已锁定本人行
+            raise err(403, "无权操作该通知或通知不存在")
+        saved = tx.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+    return {
+        "notification_id": notification_id,
+        "is_read": True,
+        "read_at": saved["read_at"],
+    }
 
 
 # ---------------------------------------------------------------------------

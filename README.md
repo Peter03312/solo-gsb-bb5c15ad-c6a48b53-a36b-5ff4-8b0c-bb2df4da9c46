@@ -15,7 +15,9 @@
 时刻签发**一次性阅览凭证**（截止时刻须在未来且早于已安排的清除时刻；
 凭证明文不可猜测、库内只存摘要、明文仅签发时返回，响应同时给出供撤销的
 凭证编号），复核人凭明文在截止前读取一次正文与摘要，并发兑换至多一次成功，
-封存人可凭凭证编号在兑换前撤销。
+封存人可凭凭证编号在兑换前撤销。资料开封、到期清除、见证人替换与交接确认
+时，系统还会在状态变更的同一事务内向当时的封存人/见证人**投递站内通知**，
+账号凭现有 `X-API-Key` 以事件序号游标分页读取本人通知、按通知编号标记已读。
 技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
@@ -55,6 +57,13 @@
 | 兑换与清除同事务 | 兑换（及撤销）临界区先在同一事务结算到期清除；**清除时刻与兑换同刻以清除优先**——清除先提交落库、兑换统一拒绝且不返回正文；兑换不因结算清除而留下兑付记录 |
 | 凭证失败不泄露 | 无效凭证、过期、撤销、已兑付、已清除资料的兑换**统一 404 同一文案**，无法区分凭证/资料是否存在，绝不返回正文；任何失败兑换不写审计 |
 | 凭证审计 | 签发、成功兑换、撤销均追加到原有 `audit_log` 审计链（动作 `view_pass_issued`/`view_pass_redeemed`/`view_pass_revoked`；外部复核人兑换的 `actor` 为 `null`）；凭证相关事件同样进入审计快照 |
+| 站内通知投递 | 资料**开封**（`opened`）或**到期清除**（`purged`）时，在状态变更的同一写事务内向“当时封存人 + 三名见证人”各记一条；**见证人替换**（`witness_replaced`）时通知封存人和新旧见证人；**交接确认**（`handover_confirmed`）时通知新旧封存人及三名见证人。收件人按状态变更时刻的名单在事务内固定 |
+| 通知事件序号 | 通知的 `event_seq` 固定为该状态变更**主审计记录的 `audit_log.id`**（全局事件序号），通知按 `(event_seq, id)` 升序排列；同一事件对每名收件人恰好一条，`UNIQUE(recipient_id, event_seq)` 与“同事务写入”共同保证扫描器与请求并发结算同一变化不重复投递 |
+| 通知最小内容 | 通知只含资料编号 `document_id`、事件类型 `event_type`、事件时刻 `at`、已读状态 `is_read`（外加通知编号与事件序号），**不含正文、凭证或密钥**；标记已读不写审计链 |
+| 通知读取与已读 | 账号凭现有 `X-API-Key` 读取本人通知：`GET /notifications?cursor=<非负事件序号>&page_size=<1～100>`，返回本人通知与下一游标（`next_cursor`，无更多时为 `null`）；`POST /notifications/{id}/read` 按通知编号标记已读并返回已读状态 |
+| 通知参数与越权拒绝 | 非法游标（负数/非整数）或页大小（不在 1～100）一律 `422` 且不改状态；标记他人或不存在的通知编号统一 `403`（不区分是否存在）且不改状态；已读重试幂等（保留首次 `read_at`，不产生额外记录）；无凭据 `401` |
+| 失权不影响收件箱 | 被替换的旧见证人、交接后的旧封存人等失去资料权限的人，仍可读取/标记自己收到的通知；但通知不含正文/凭证/密钥，不能借此访问资料（资料接口仍按参与方规则 `403`） |
+| 失败不留通知 | 通知与状态变更在同一个 `BEGIN IMMEDIATE` 事务内写入：失败或回滚的操作（错误同意、无效替换、被拒交接、撤销、邀请逾期等）不留通知；仅成功的开封/清除/替换/交接确认才投递 |
 
 ### 请求状态机
 
@@ -162,6 +171,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/documents/{id}/audit-snapshots` | 当前封存人或当前指定见证人签发审计快照，返回快照、签名与公钥标识 |
 | GET | `/audit-snapshots/public-key` | 查询快照签名公钥与标识（无需凭据，供复核人事先建立信任） |
 | POST | `/audit-snapshots/verify` | 离线验真：`{snapshot, signature, public_key}`，无需凭据 |
+| GET | `/notifications` | 读取本人通知：查询参数 `cursor`（非负事件序号，默认 0）、`page_size`（1～100，默认 20）；返回 `notifications` 与 `next_cursor` |
+| POST | `/notifications/{id}/read` | 把本人的一条通知标记已读，返回 `{notification_id, is_read, read_at}`；他人/不存在编号统一 `403` |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
@@ -175,6 +186,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 清除时刻已到仍改期/取消、无清除安排仍取消、撤销已兑付/已撤销/已过期凭证等）`409`。
 凭证兑换的全部失败（无效明文、过期、撤销、已兑付、资料已清除）统一
 **`404` 同一文案**，不区分原因、不泄露正文或资料存在性。
+通知接口：游标或页大小非法为 `422`；标记他人或不存在的通知编号统一 `403`
+（不改状态、不区分是否存在）；缺少/错误凭据 `401`。
 错误体统一为 `{"detail": "..."}`，不含任何正文内容。
 
 ### 最早开封时刻（earliest_open_at）
@@ -527,6 +540,87 @@ curl -sS -X POST $BASE/view-passes/7/revoke -H "X-API-Key: $OWNER_KEY"
 可运行的端到端示例：`python examples/demo_view_pass.py`
 （默认 `http://127.0.0.1:8000`，可传入自定义地址）。
 
+### 站内通知（notifications）
+
+资料发生四类状态变更时，系统在**状态变更的同一写事务内**向当时的参与方各投递
+一条站内通知，收件人按变更时刻的名单在事务内固定：
+
+| 事件 `event_type` | 触发时机 | 收件人 |
+| --- | --- | --- |
+| `opened` | 资料开封（第二票即时开封，或到点自动开封/清除结算中补开） | 当时的封存人 + 三名见证人 |
+| `purged` | 到期清除生效（扫描器、写事务或资料查询确定性结算） | 当时的封存人 + 三名见证人 |
+| `witness_replaced` | 封存人成功替换一名指定见证人 | 封存人 + 旧见证人 + 新见证人（另两名见证人也各收到一条） |
+| `handover_confirmed` | 受让人确认交接、封存人身份转移 | 新旧封存人 + 三名见证人 |
+
+- **事件序号**：每条通知带 `event_seq`，等于该状态变更主审计记录（`opened` /
+  `purged` / `witness_replaced` / `handover_confirmed`）在 `audit_log` 上的
+  全局自增序号。同一事件的所有收件人通知共享同一 `event_seq`；列表按
+  `(event_seq, id)` 升序，故通知顺序与审计链上的事件顺序一致。
+- **最小内容**：通知只有 `notification_id`、`event_seq`、`document_id`、
+  `event_type`、`at`、`is_read`，**不含正文、阅览凭证、签名或任何密钥**。
+  通知本身不进入审计链，标记已读也不写审计。
+- **同事务、不重复、失败不留**：通知与状态变更在同一 `BEGIN IMMEDIATE`
+  事务内写入——变更回滚则通知一并回滚（失败/被拒操作不留通知），变更提交则
+  通知必已存在；`UNIQUE(recipient_id, event_seq)` 与同事务写入共同保证后台
+  扫描器与请求并发结算同一变化（同一次到点开封/清除）时每名收件人至多一条。
+- **失权仍可收件**：被替换掉的旧见证人、交接后的旧封存人随即失去资料接口
+  权限（仍统一 `403`），但仍可列出、翻页、标记自己收到的通知；通知不提供
+  任何资料内容，不能借此访问资料。
+
+读取本人通知（需 `X-API-Key`）：
+
+- `GET /notifications?cursor=<事件序号>&page_size=<页大小>`
+  - `cursor`：非负整数，默认 `0`；只返回 `event_seq > cursor` 的本人通知
+    （游标即“上一页最后一条通知的 `event_seq`”）。负数或非整数 `422`。
+  - `page_size`：整数，范围 `1～100`，默认 `20`；越界 `422`。
+  - 成功 `200`：
+
+    ```json
+    {
+      "notifications": [
+        {"notification_id": 5, "event_seq": 12, "document_id": 2,
+         "event_type": "witness_replaced",
+         "at": "2026-10-02T01:24:58.763282+00:00", "is_read": false}
+      ],
+      "next_cursor": 12
+    }
+    ```
+
+    `next_cursor` 为本页最后一条通知的事件序号，用它作为下一次请求的
+    `cursor` 即可继续翻页；本页之后无更多通知时 `next_cursor` 为 `null`。
+
+标记已读（需 `X-API-Key`）：
+
+- `POST /notifications/{notification_id}/read`，无请求体。把本人名下该通知
+  置为已读并返回 `{"notification_id", "is_read": true, "read_at": "…"}`。
+  - 重复标记幂等：`read_at` 保留**首次**标记时刻，不产生任何额外记录；
+  - 标记他人通知或不存在的编号统一 `403`
+    `{"detail": "无权操作该通知或通知不存在"}`，不区分是否存在，且不改状态；
+  - 缺少/错误 `X-API-Key` 为 `401`。
+
+```bash
+# 第一页（页大小 20，从事件序号 0 之后开始）
+curl -sS "$BASE/notifications?cursor=0&page_size=20" -H "X-API-Key: $OWNER_KEY"
+# -> {"notifications":[{"notification_id":1,"event_seq":10,"document_id":1,
+#     "event_type":"opened","at":"…","is_read":false}, …],
+#     "next_cursor":12}
+
+# 用 next_cursor 翻下一页
+curl -sS "$BASE/notifications?cursor=12&page_size=20" -H "X-API-Key: $OWNER_KEY"
+
+# 标记一条本人通知为已读（重复调用幂等，read_at 不变）
+curl -sS -X POST "$BASE/notifications/1/read" -H "X-API-Key: $OWNER_KEY"
+# -> {"notification_id":1,"is_read":true,"read_at":"…"}
+
+# 拒绝示例（均不改状态）：
+#   cursor=-1 / page_size=0 / page_size=101 -> 422；
+#   标记他人或不存在的通知编号 -> 403；无/错 X-API-Key -> 401。
+```
+
+可运行的端到端示例：`python examples/demo_notifications.py`
+（覆盖四类事件投递、失权后仍可读通知、游标分页、标记已读幂等、越权与非法
+参数拒绝、到期清除去重）。
+
 ### 审计快照签发与离线验真（audit snapshot）
 
 资料参与方需要把封存过程交给离线复核人核验时，**当前封存人或当前指定见证人**
@@ -673,6 +767,7 @@ python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾�
 python3 examples/demo_purge.py           # 到期清除：安排/改期/取消/到点清除/连带失效/时序规则/交接后管理权
 python3 examples/demo_audit_snapshot.py  # 审计快照：签发/验真/篡改失败/版本与公钥失败/交接后旧封存人禁签
 python3 examples/demo_view_pass.py       # 一次性阅览凭证：签发/无账号兑换一次/再兑换404/兑换前撤销
+python3 examples/demo_notifications.py   # 站内通知：开封/替换/交接/清除投递、游标分页、标记已读与拒绝场景
 ```
 
 ### 典型拒绝场景
@@ -731,6 +826,15 @@ python -m pytest -q
 （同刻清除优先、清除先提交再拒绝）、已清除资料兑换统一 404 不泄露正文或存在性、
 签发/兑换/撤销写入原审计链并进入快照，以及 TestClient 多线程的
 **并发兑换、兑换 vs 撤销赛跑**（只产生一个终态）。
+站内通知测试覆盖：开封（即时/到点自动）与到期清除（扫描器/写事务/读路径
+三种结算）向当时封存人 + 三名见证人各投递一条、替换见证人通知封存人与新旧
+见证人、交接确认通知新旧封存人与见证人、收件人随变更时刻名单固定（替换后
+开封旧见证人不收、交接后开封旧封存人不收）、`event_seq` 取主审计序号且
+升序排列、通知只含最小字段不含正文/摘要、失败与回滚操作不留通知、非负游标
+与 1～100 页大小分页及边界/非法参数 `422`、按编号标记已读幂等（`read_at`
+保留首次）、他人/不存在编号统一 `403` 不改状态、缺凭据 `401`、失去资料
+权限后仍可读并标记本人通知但不能借此访问资料，以及真实 uvicorn + 多线程的
+**多请求并发结算同一次到点清除**（每名参与方恰好一条 purged，不重复投递）。
 
 ## 项目结构
 
@@ -741,11 +845,11 @@ app/
   schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、快照验真入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

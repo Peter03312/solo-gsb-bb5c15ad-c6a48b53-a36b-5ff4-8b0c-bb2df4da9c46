@@ -107,6 +107,30 @@ CREATE TABLE IF NOT EXISTS view_passes (
 );
 CREATE INDEX IF NOT EXISTS idx_view_passes_document ON view_passes(document_id);
 
+-- 站内通知：资料开封/到期清除/见证人替换/交接确认四类状态变更发生时，
+-- 在状态变更的同一写事务内给“当时的封存人与见证人”各写一条。
+-- event_seq 固定为该状态变更主审计记录的 audit_log.id（全局事件序号），
+-- 通知按 event_seq 排列；UNIQUE(recipient_id, event_seq) 保证同一收件人
+-- 对同一事件至多一条（扫描器与请求并发结算同一变化也不重复投递）。
+-- 通知内容只有资料编号、事件类型、时刻与已读状态——不含正文、凭证或密钥；
+-- 收件人即便后来失去资料权限，仍可读取自己收到的通知（不再反查资料权限）。
+CREATE TABLE IF NOT EXISTS notifications (
+    id           INTEGER PRIMARY KEY,
+    recipient_id INTEGER NOT NULL REFERENCES users(id),
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    event_seq    INTEGER NOT NULL,
+    event_type   TEXT NOT NULL CHECK (event_type IN
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed')),
+    at           TEXT NOT NULL,            -- 事件时刻（开封/清除时刻等，UTC 字符串）
+    is_read      INTEGER NOT NULL DEFAULT 0,
+    read_at      TEXT,                     -- 首次标记已读时刻；重试保留，不产生额外记录
+    created_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_recipient_event
+    ON notifications(recipient_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_seq
+    ON notifications(recipient_id, event_seq, id);
+
 -- 审计快照签名密钥：单行表，首次使用时生成并持久化，
 -- 重启后旧快照签名仍可验证；secret_seed 仅服务端持有，任何接口不返回。
 CREATE TABLE IF NOT EXISTS signing_keys (
